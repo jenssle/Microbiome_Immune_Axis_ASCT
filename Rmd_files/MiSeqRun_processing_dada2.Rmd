@@ -1,0 +1,287 @@
+---
+title: "dada2 based miseqrun processing"
+author: "ensslejc"
+format: 
+  gfm : 
+    code-fold: false
+editor: visual
+date: "`r Sys.Date()`"
+knitr:
+  opts_chunk:
+    message: false
+    warning: false
+---
+
+This is the standard script to process 16S sequencing data from fecal samples. Per miseq run, a mock sample was included to determine the accuracy of the taxonomy inference.
+
+## Setup
+
+### Packages
+
+```{r, eval = FALSE}
+library(tidyverse)
+library(dada2)
+```
+
+### unzip files
+
+Unzip your fastq.
+
+```{bash, eval = FALSE}
+cd /home/your_dir/MISeq_run/unzipped
+
+gzip -d *.gz
+```
+
+### Set path
+
+```{r, eval = FALSE}
+path <- "~/your_dir/MISeq_run/unzipped"
+
+list.files(path= ath)
+```
+
+## Processing
+
+### Read in the names
+
+```{r, eval = FALSE}
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_L001"), `[`, 1)
+```
+
+### Inspect the quality profiles
+
+```{r, eval = FALSE}
+plotQualityProfile(fnFs[1:6])
+```
+
+### Filter and trim
+
+Assign the filenames for the filtered fastq.gz files.
+
+```{r, eval = FALSE}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+Run the filtering with standard parameters. Trim and truncation was optimized by manual inspection of grid search.
+
+```{r, eval = FALSE}
+out <-
+  filterAndTrim(
+    fnFs,
+    filtFs,
+    fnRs,
+    filtRs,
+    trimLeft = c(17,21),
+    truncLen = c(285, 240), 
+    maxN = 0,
+    maxEE = c(2, 2),
+    truncQ = 2,
+    rm.phix = TRUE,
+    compress = TRUE,
+    multithread = as.integer(60)
+  ) 
+
+head(out)
+```
+
+### Learn the error rates
+
+```{r, eval = FALSE}
+errF <- learnErrors(filtFs, multithread=as.integer(40))
+
+errR <- learnErrors(filtRs, multithread=as.integer(40))
+```
+
+Make sure that zero read files are removed from the sample name list.
+
+```{r, eval = FALSE}
+filtFs <- filtFs[file.exists(filtFs)]
+filtRs <- filtRs[file.exists(filtRs)]
+```
+
+### Sample inference
+
+```{r, eval = FALSE}
+dadaFs <- dada(filtFs, err=errF, multithread=as.integer(40))
+
+dadaRs <- dada(filtRs, err=errR, multithread=as.integer(40))
+```
+
+Check the returned dada class object.
+
+```{r, eval = FALSE}
+dadaFs[[1]]
+```
+
+### Merge paired reads
+
+```{r, eval = FALSE}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+```
+
+### Construct sequence table
+
+```{r, eval = FALSE}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+
+### Inspect the distribution of sequence lengths
+
+```{r, eval = FALSE}
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+```
+
+### Remove chimeras
+
+```{r, eval = FALSE}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=as.integer(40), verbose=TRUE)
+dim(seqtab.nochim)
+
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+### Track reads through the pipeline
+
+```{r, eval = FALSE}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+
+#add the fraction information
+track <- track %>% 
+  as.data.frame() %>%
+  mutate(perc_input = nonchim/input, 
+         perc_filtered = nonchim/filtered, 
+         perc_merged = nonchim/merged)
+
+rownames(track) <- sample.names
+head(track)
+```
+
+Visualize the respective readouts.
+
+```{r, eval = FALSE}
+library(cowplot)
+
+plot_grid(
+  ggplot(track, aes(nonchim)) +
+    geom_histogram() +
+    theme_bw(),
+  
+  ggplot(track, aes(perc_input)) +
+    geom_histogram() +
+    theme_bw()
+)
+```
+
+### Assign taxonomy
+
+To do so, the DADA2 implementation of the naive Bayesian classifier method is applied.
+
+```{r, eval = FALSE}
+taxa <-
+  assignTaxonomy(seqtab.nochim,
+                  "/home/your_dir/silva_nr99_v138.1_train_set.fa.gz",
+                 multithread=as.integer(70))
+```
+
+Lets investigate the assignment.
+
+```{r, eval = FALSE}
+taxa.print <- taxa 
+rownames(taxa.print) <- NULL
+head(taxa.print, 50)
+```
+
+## Phyloseq workup
+
+```{r, eval = FALSE}
+library(phyloseq)
+library(Biostrings)
+library(ggplot2)
+```
+
+Read in the meta data.
+
+```{r, eval = FALSE}
+metadf <- read.delim("/home/your_dir/MISeq_run/sample_meta.txt", header=FALSE, comment.char="#")
+
+colnames(metadf) <- c("sample", "internal_n", "sample_id", "part_of_study", "Index_1", "Index_2")
+
+rownames(metadf) <- metadf$sample
+
+seqtab.nochim2 <- seqtab.nochim %>%
+  as.data.frame() %>%
+  rownames_to_column("rwn") %>%
+  separate(rwn, c("keep", "remove"), sep = "_S")
+
+rownames(seqtab.nochim) <- seqtab.nochim2$keep
+
+metadf1 <- metadf[match(rownames(seqtab.nochim), metadf$internal_n),] %>%
+  mutate(internal_n = as.character(internal_n)) %>%
+  left_join(track %>% 
+              rownames_to_column("rwn") %>%
+              separate(rwn, c("internal_n", "remove"), sep = "_S") %>%
+              mutate(internal_n = as.character(internal_n)) %>%
+              dplyr::select(internal_n, perc_input), 
+            by = "internal_n")%>%
+  drop_na(internal_n)
+
+rownames(metadf1) <- metadf1$internal_n
+
+study_samples <- (metadf1 %>% filter(perc_input > 0.4, 
+                                     part_of_study == "yes"))$sample
+```
+
+Construct a phyloseq object from the dada2 output.
+
+```{r, eval = FALSE}
+ps <- phyloseq(
+  otu_table(seqtab.nochim, taxa_are_rows = FALSE),
+  sample_data(metadf1),
+  tax_table(taxa)
+)
+```
+
+Investigate the mock sample as quality control.
+
+```{r, eval = FALSE}
+ps.mock <- ps
+ps.mock <- prune_samples(sample_names(ps.mock) == "20210715-95", ps.mock) 
+```
+
+Visualize via barplot. The theoretical composition should be as follows: Listeria monocytogenes - 12%, Pseudomonas aeruginosa - 12%, Bacillus subtilis - 12%, Escherichia coli - 12%, Salmonella enterica - 12%, Lactobacillus fermentum - 12%, Enterococcus faecalis - 12%, Staphylococcus aureus - 12%, Saccharomyces cerevisiae - 2%, and Cryptococcus neoformans - 2%.
+
+```{r, eval = FALSE}
+top20 <- names(sort(taxa_sums(ps.mock), decreasing=TRUE))[1:20]
+ps.top20 <- transform_sample_counts(ps.mock, function(OTU) OTU/sum(OTU))
+ps.top20 <- prune_taxa(top20, ps.top20)
+plot_bar(ps.top20, x="internal_n", fill="Genus")
+```
+
+Now, subset for samples part of the study:
+
+```{r, eval = FALSE}
+ps_study <- prune_samples(sample_names(ps) %in% rownames(metadf1 %>% filter(perc_input > 0.4, 
+                                     part_of_study == "yes")), ps) 
+```
+
+Save the phyloseq object.
+
+```{r, eval = FALSE}
+saveRDS(ps_study, "/home/your_dir/miseqrun_phyloseq_processed.rds")
+```

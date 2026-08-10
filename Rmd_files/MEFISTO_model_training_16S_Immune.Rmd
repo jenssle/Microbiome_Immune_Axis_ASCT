@@ -1,0 +1,253 @@
+---
+title: "20250206_autohsct_MEPHISTO"
+author: "jenssle"
+date: "06 02 2025"
+output: html_document
+---
+
+## Setup 
+
+Load the packages 
+
+```{r}
+library(MOFA2)
+library(phyloseq)
+library(tidyverse)
+library(microViz)
+library(readxl)
+
+`%not_in%` <- purrr::negate(`%in%`)
+```
+
+Load the processed 16S data in form of a phyloseq object.
+
+```{r}
+ps <- readRDS("/home/FFM16S_phylo.rds")
+```
+
+## 16S processing
+
+Filter for OTUs that only appear in at least 1 percent of our samples and transform using robust centered log ratio transformation (rclr).
+
+```{r}
+ps2 <- ps %>%
+  tax_filter(min_prevalence = 0.005, 
+             min_total_abundance = 10) %>%
+  tax_fix() %>% 
+  tax_agg(rank = "Family")
+
+#Subset to those taxa identified on the family level
+ps3 <- subset_taxa(ps2, Family %in% colnames(otu_table(ps2) %>%
+                                               as.data.frame())[!grepl(
+                                                 "roup|class|Class|Kingdom|TC|Order|Phylum|Mitochondria|UCG|vadin",
+                                                 colnames(otu_table(ps2) %>%
+                                                            as.data.frame())
+                                               )])
+#Now, perform the transformance
+ps3 <- tax_transform(ps3, "rclr")
+
+
+df_otu <- otu_table(ps3) %>% 
+  as.data.frame() 
+```
+
+Read in the timepoint info for the timepoint-acounting modelling. 
+
+```{r}
+meta_df <- read_excel("/home/FFM16S_metadata.xlsx") %>%
+  dplyr::select(Unique_ID, Pat_ID, Timepoint, Diffdays, InvSimpson, Mibi_ID) %>%
+  mutate(Mibi_ID = as.character(Mibi_ID))
+```
+
+Extract the OTU table and shape for the use in MEFISTO.
+
+```{r}
+library(psych)
+library(readxl)
+
+#bring it into long shape
+df_otu_long <- df_otu %>%
+  rownames_to_column("seq_ID") %>%
+  pivot_longer(!seq_ID, names_to = "feature", values_to = "value")
+
+#add the meta information which is stored in the ps objects meta data
+df_meta <- sample_data(ps) %>%
+  as.data.frame()
+
+df_meta$seq_ID <- rownames(sample_data(ps))
+
+df_meta <- left_join(
+  as.tibble(df_meta) %>%
+    dplyr::select(-Timepoint),
+  meta_df,
+  by = "Mibi_ID"
+) %>%
+  distinct(internal_n, .keep_all = TRUE) %>%
+  drop_na(Diffdays) %>%
+  mutate(Mibi_ID = as.character(Mibi_ID)) %>%
+  mutate(ent = case_when(grepl("Myelom|Plasmozytom", entity) ~ "MM",
+                         TRUE~ "other"))
+
+df_otu_long <- left_join(
+  df_otu_long %>%
+    dplyr::filter(seq_ID %in% df_meta$seq_ID), 
+  df_meta[,c("seq_ID", "Mibi_ID", "ID", "Diffdays", "entity", "InvSimpson")], 
+  by = "seq_ID"
+) 
+
+df_mofa <- df_otu_long %>%
+  dplyr::rename(
+    c("group" = "ID"), 
+    c("sample" = "seq_ID")
+  ) %>%
+  filter(group != "Mock") %>%
+  mutate(view = "16S") %>%
+  drop_na(Diffdays)
+```
+
+## Process immune data
+
+Read in the immune data and bring to right format.
+
+```{r}
+df_immuno <- read_excel("/home/FFMImmuneData.xlsx")
+
+#collect the immune cell names
+immun_cells <- colnames(df_immuno)[22:51]
+
+df_immuno1 <- df_immuno %>%
+  dplyr::select(c("Mibi_ID", immun_cells)) %>%
+  mutate(Mibi_ID = as.character(Mibi_ID)) %>%
+  pivot_longer(!Mibi_ID, names_to = "feature", values_to = "value") %>%
+  left_join(
+        df_mofa %>%
+          filter(Mibi_ID %in% df_immuno$Mibi_ID) %>%
+          dplyr::select(
+            "sample",
+            "Mibi_ID",
+            "group",
+            "Diffdays",
+            "entity",
+            "view",
+            "InvSimpson"
+          ) %>%
+          mutate(view = "immuno") %>%
+          distinct(sample, .keep_all = TRUE),
+        by = "Mibi_ID"
+      ) %>% drop_na(sample)
+
+
+df_mofa_immuno <- df_mofa %>%
+  rbind(df_immuno1)
+
+df_mofa_immu <- df_mofa %>%
+  filter(sample %in% df_immuno$sample) %>%
+  rbind(
+    df_immuno %>%
+      filter(sample %in% df_mofa$sample) %>%
+      left_join(
+        df_mofa %>%
+          filter(sample %in% df_immuno$sample) %>%
+          dplyr::select(
+            "sample",
+            "Mibi_ID",
+            "group",
+            "Diffdays",
+            "entity",
+            "view",
+            "InvSimpson"
+          ) %>%
+          mutate(view = "immuno") %>%
+          distinct(sample, .keep_all = TRUE),
+        by = "sample"
+      )
+  )
+```
+
+## Prepare and train MOFA
+
+Create MOFA object
+
+```{r}
+mofa_ob_untr <- create_mofa(data = df_mofa %>%
+                              mutate(group = "1"))
+
+mofa_ob_untr
+```
+
+Set the timevariable.
+
+```{r}
+mofa_ob_untr <- set_covariates(mofa_ob_untr,
+                                       covariates = "Diffdays")
+```
+
+Show the data overview.
+
+```{r}
+plot_data_overview(mofa_ob_untr,
+                               show_covariate = FALSE,
+                               show_dimensions = FALSE) 
+```
+
+Set model options.
+
+```{r}
+data_opts <- get_default_data_options(mofa_ob_untr)
+data_opts$center_groups <- FALSE
+
+model_opts <- get_default_model_options(mofa_ob_untr)
+model_opts$num_factors <- 15
+
+mefisto_opts <- get_default_mefisto_options(mofa_ob_untr)
+mefisto_opts$n_grid <- 10
+mefisto_opts$start_opt <- 50
+mefisto_opts$opt_freq <- 50
+mefisto_opts$model_groups <- FALSE 
+
+train_opts <- get_default_training_options(mofa_ob_untr)
+train_opts$seed <- 069
+```
+
+Prepare model.
+
+```{r}
+mofa_ob_untr <- prepare_mofa(
+  object = mofa_ob_untr,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts,
+  mefisto_options = mefisto_opts
+) 
+```
+
+Train the MEFISTO model. 
+
+```{r}
+##################################
+## Define python version to use ##
+##################################
+
+reticulate::use_python("/home/jenssle/miniconda3/bin/python", required = TRUE)
+
+#####################
+## Train the model ##
+#####################
+
+outfile <- paste0(getwd(),"/home/_mefisto_16S_imuno")
+mofa_ob_tr <- run_mofa(mofa_ob_untr,
+                       outfile,
+                       use_basilisk = TRUE
+                       )
+```
+
+## Collect data
+
+Extract the factors and save.
+
+```{r}
+mefisto_latent <- get_factors(mofa_ob_tr, factors = "all")$`1` %>%
+  as.data.frame() 
+
+saveRDS(mefisto_latent, file = "/home/mefisto_LF.rds")
+```
