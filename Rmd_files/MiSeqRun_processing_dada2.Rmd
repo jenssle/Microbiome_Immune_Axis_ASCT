@@ -1,15 +1,8 @@
 ---
-title: "dada2 based miseqrun processing"
-author: "ensslejc"
-format: 
-  gfm : 
-    code-fold: false
-editor: visual
+title: "MiSeq processing dada2"
+author: "jenssle"
 date: "`r Sys.Date()`"
-knitr:
-  opts_chunk:
-    message: false
-    warning: false
+output: html_document
 ---
 
 This is the standard script to process 16S sequencing data from fecal samples. Per miseq run, a mock sample was included to determine the accuracy of the taxonomy inference.
